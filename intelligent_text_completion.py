@@ -10,20 +10,28 @@
 # FOR A PARTICULAR PURPOSE. See the GNU General Public License for more
 # details.
 
-from gi.repository import Gtk, GObject, Gedit, PeasGtk
+from gi.repository import Gtk, GObject, Pluma, Peas, Gio
 import re
 import traceback
-import gconf
 
-class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, PeasGtk.Configurable):
-    window = GObject.property(type=Gedit.Window)
+class IntelligentTextCompletionPlugin(GObject.Object, Peas.Activatable):
+    __gtype_name__ = "IntelligentTextCompletionPlugin"
+    object = GObject.property(type=GObject.Object)
 
     def __init__(self):
         GObject.Object.__init__(self)
         self._instances = {}
+        # self.create_configure_dialog = create_configure_dialog2
 
-    def do_create_configure_widget(self):
-        return IntelligentTextCompletionOptions.get_instance().create_configure_dialog()
+    def create_configure_dialog_func(self):
+        dialog = Gtk.Dialog()
+        content = dialog.get_content_area()
+        content.add(IntelligentTextCompletionOptions.get_instance().create_configure_dialog())
+
+        window = pluma.app_get_default().get_active_window()
+        if window:
+            dialog.set_transient_for(window)
+        return dialog
 
     def _connect_view(self, view, window):
         """Connect to view's editing signals."""
@@ -43,7 +51,7 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
 
     def do_activate(self):
         """Activate plugin."""
-        window = self.window
+        window = self.object
         callback = self._on_window_tab_added
         id_1 = window.connect("tab-added", callback)
         callback = self._on_window_tab_removed
@@ -55,7 +63,7 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
 
     def do_deactivate(self):
         """Deactivate plugin."""
-        window = self.window
+        window = self.object
         widgets = [window]
         widgets.extend(window.get_views())
         widgets.extend(window.get_documents())
@@ -84,7 +92,7 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
         # get cursor
         cursor = doc.get_iter_at_mark(doc.get_insert())
         # get typed string
-        typed_string = unicode(event.string, 'UTF-8')
+        typed_string = event.string
         # get previous char
         prev_char = None
         if not cursor.get_line_offset() == 0:
@@ -221,6 +229,26 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
                 else:
                     return False # do nothing
 
+        ################### auto-complete django tags ###################
+        if options.completeXML: # TODO: make separate setting for this
+            if typed_char == "{":
+                # The normal opening and closing paradigm does not autocomplete
+                # for instance <a href="{{ url }}"> becase {{ url }} is inside
+                # of a sequence preventing autoclosing of brackets.
+                # We fix that here...
+                if next_char in open_close.values():
+                    # The next character has prevented a proper closing } from
+                    # being inserted
+                    return self._insert_at_cursor(typed_char, "}")
+            if prev_char == "{" and typed_char == "%":
+                # insert code
+                self._insert_at_cursor("%  %")
+                # refresh cursor and move it to the middle
+                cursor = doc.get_iter_at_mark(doc.get_insert())
+                cursor.set_offset(cursor.get_offset() - 2)
+                doc.place_cursor(cursor)
+                return True
+
         ################### detect lists ###################
         if options.detectLists:
             if event.keyval == 65293: # return
@@ -281,10 +309,14 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
                             add_middle = typed_char + whitespace + get_tab_string(view)
                             add_end = ""
                         return self._insert_at_cursor(add_middle, add_end)
-
+            if typed_char == '}':
+                if preceding_line and preceding_line.isspace():
+                    whitespace_pos_iter = cursor.copy()
+                    whitespace_pos_iter.set_line_offset(whitespace_pos)
+                    return self._remove_at_cursor(whitespace_pos_iter) and self._insert_at_cursor("}")
 
     def _insert_at_cursor(self, middle, end = ""):
-        window = self.window
+        window = self.object
         doc = window.get_active_document()
         doc.insert_at_cursor(middle + end)
         # refresh cursor and move it to the middle
@@ -293,6 +325,10 @@ class IntelligentTextCompletionPlugin(GObject.Object, Gedit.WindowActivatable, P
         doc.place_cursor(cursor)
         return True
 
+    def _remove_at_cursor(self, pos):
+        window = self.object
+        doc = window.get_active_document()
+        return doc.backspace(pos, False, True)
 
 ##### regular functions #####
 
@@ -357,17 +393,17 @@ class IntelligentTextCompletionOptions(object):
     _autoindentAfterFunctionOrListButton = None
 
     ## configuration client
-    _GCONF_SETTINGS_DIR = "/apps/gedit-3/plugins/intelligent_text_completion"
-    _gconf_client = None
+    _BASE_KEY = "apps.pluma.plugins.intelligent_text_completion"
+    _settings = None
 
     ## static singleton reference
     singleton = None
 
     def __init__(self):
-        # create gconf directory if not set yet
-        self._gconf_client = gconf.client_get_default()
-        if not self._gconf_client.dir_exists(self._GCONF_SETTINGS_DIR):
-            self._gconf_client.add_dir(self._GCONF_SETTINGS_DIR, gconf.CLIENT_PRELOAD_NONE)
+        # create settings directory if not set yet
+        #self._settings = Gio.Settings.new(self._BASE_KEY)
+        #if not self._gconf_client.dir_exists(self._GCONF_SETTINGS_DIR):
+        #    self._gconf_client.add_dir(self._GCONF_SETTINGS_DIR, gconf.CLIENT_PRELOAD_NONE)
 
         # load settings
         self.closeBracketsAndQuotes = self._load_setting("closeBracketsAndQuotes")
@@ -387,6 +423,12 @@ class IntelligentTextCompletionOptions(object):
         # make vertically stacking box
         vbox = Gtk.VBox()
         vbox.set_border_width(6)
+
+        # add warning
+        box = Gtk.HBox()
+        label = Gtk.Label("Warning: these options are not yet persistent")
+        box.pack_start(label, False, False, 6)
+        vbox.pack_start(box, False, True, 0)
 
         # add checkboxes
         self._closeBracketsAndQuotesButton = self._add_setting_checkbox(
@@ -434,11 +476,10 @@ class IntelligentTextCompletionOptions(object):
         self._save_setting("autoindentAfterFunctionOrList", self.autoindentAfterFunctionOrList)
 
     def _save_setting(self, setting_name, value):
-        self._gconf_client.set_bool("{}/{}".format(self._GCONF_SETTINGS_DIR, setting_name), value)
+        pass
+        #self._gconf_client.set_bool("{}/{}".format(self._GCONF_SETTINGS_DIR, setting_name), value)
 
     def _load_setting(self, setting_name):
-        try:
-            return self._gconf_client.get_bool("{}/{}".format(self._GCONF_SETTINGS_DIR, setting_name))
-        except Exception, e: # catch, just in case
-            print e
+        return True
+        #return self._gconf_client.get_bool("{}/{}".format(self._GCONF_SETTINGS_DIR, setting_name))
 
